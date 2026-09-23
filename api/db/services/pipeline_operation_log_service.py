@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from peewee import fn
 
 from api.db import VALID_PIPELINE_TASK_TYPES
-from api.db.db_models import DB, Document, PipelineOperationLog
+from api.db.db_models import DB, Document, Knowledgebase, PipelineOperationLog
 from api.db.services.canvas_service import UserCanvasService
 from api.db.services.common_service import CommonService
 from api.db.services.document_service import DocumentService
@@ -150,9 +150,11 @@ class PipelineOperationLogService(CommonService):
             DocumentService.update_progress_immediately([document.to_dict()])
 
         ok, document = DocumentService.get_by_id(referred_document_id)
-        if not ok:
+        if not ok or document is None:
             logging.warning(f"Document for referred_document_id {referred_document_id} not found")
             return None
+
+        document_kb_id = document.kb_id
 
         # From document
         title = document.parser_id
@@ -268,16 +270,61 @@ class PipelineOperationLogService(CommonService):
 
             obj = cls.save(**log)
 
-            limit = int(os.getenv("PIPELINE_OPERATION_LOG_LIMIT", 1000))
-            total = cls.model.select().where(cls.model.kb_id == document.kb_id).count()
-
-            if total > limit:
-                keep_ids = [m.id for m in cls.model.select(cls.model.id).where(cls.model.kb_id == document.kb_id).order_by(cls.model.create_time.desc()).limit(limit)]
-
-                deleted = cls.model.delete().where(cls.model.kb_id == document.kb_id, cls.model.id.not_in(keep_ids)).execute()
-                logging.info(f"[PipelineOperationLogService] Cleaned {deleted} old logs, kept latest {limit} for {document.kb_id}")
+        cls._prune_logs(document_kb_id, int(os.getenv("PIPELINE_OPERATION_LOG_LIMIT", 1000)))
 
         return obj
+
+    @classmethod
+    @DB.connection_context()
+    def _prune_logs(cls, kb_id, limit):
+        """
+        Best-effort, race-free pruning of stale pipeline operation logs for one KB.
+
+        Runs in its own short transaction, serialized per KB by taking a lock on the
+        ``knowledgebase`` row (``SELECT ... FOR UPDATE``). Two concurrent
+        ``PipelineOperationLogService.create`` calls for the same KB can no longer
+        deadlock on overlapping ``DELETE ... id NOT IN (...)`` record locks: only one
+        cleaner runs at a time per KB, and it deletes by a ``create_time`` threshold
+        rather than by enumerating every kept id.
+        """
+        try:
+            with DB.atomic():
+                # Per-KB mutex: serialize prunes of the same KB (avoids 1213 deadlocks
+                # between concurrent DELETE on overlapping row sets).
+                Knowledgebase.select(Knowledgebase.id).where(Knowledgebase.id == kb_id).for_update().first()
+
+                total = cls.model.select().where(cls.model.kb_id == kb_id).count()
+                if total <= limit:
+                    return
+
+                # Keep the newest `limit` rows; delete anything strictly older than the
+                # limit-th newest row's create_time. No giant NOT IN list, so the DELETE
+                # touches a bounded set of pages and takes far fewer record locks.
+                nth_newest = (
+                    cls.model.select(cls.model.create_time)
+                    .where(cls.model.kb_id == kb_id)
+                    .order_by(cls.model.create_time.desc())
+                    .limit(1)
+                    .offset(limit - 1)
+                    .scalar()
+                )
+                if nth_newest is None:
+                    return
+
+                deleted = (
+                    cls.model.delete()
+                    .where(
+                        (cls.model.kb_id == kb_id)
+                        & (cls.model.create_time < nth_newest)
+                    )
+                    .execute()
+                )
+                logging.info(
+                    f"[PipelineOperationLogService] Cleaned {deleted} old logs, kept latest {limit} for {kb_id}"
+                )
+        except Exception:
+            # Pruning is best-effort; never let a cleanup failure fail the recorded operation.
+            logging.exception(f"[PipelineOperationLogService] Prune failed for KB {kb_id}", exc_info=True)
 
     @classmethod
     @DB.connection_context()
