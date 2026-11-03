@@ -19,6 +19,7 @@ import math
 import os
 import time
 from abc import ABC
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 from typing import Tuple, List
 from http import HTTPStatus
@@ -35,6 +36,66 @@ MAX_RERANK_TOKEN = 8196
 RERANK_TOKEN_LIMIT_MODE = os.getenv("RERANK_TOKEN_LIMIT_MODE", "truncate").strip().lower()
 if RERANK_TOKEN_LIMIT_MODE not in {"truncate", "passthrough", "raise_error"}:
     raise ValueError(f"Invalid RERANK_TOKEN_LIMIT_MODE {RERANK_TOKEN_LIMIT_MODE!r}; expected 'truncate', 'passthrough', or 'raise_error'")
+
+# Backends such as GPUStack (llama.cpp) count the query and *every* document
+# against a single context window, while the upstream adapters only cap each
+# document individually. Measured on the corporate GPUStack with Russian text:
+# a document estimated at ~6.9k tiktoken tokens (~29.6k chars) still fits the
+# 8192-token window while ~11.6k estimated tokens is rejected, i.e. the server
+# tokenizer counts ~1.2x more than tiktoken. 0.8 keeps a whole batch under the
+# real limit; RERANK_BATCH_BUDGET_RATIO can be lowered further per deployment.
+RERANK_BATCH_BUDGET_RATIO = float(os.getenv("RERANK_BATCH_BUDGET_RATIO", "0.8"))
+if not 0 < RERANK_BATCH_BUDGET_RATIO <= 1:
+    raise ValueError(f"Invalid RERANK_BATCH_BUDGET_RATIO {RERANK_BATCH_BUDGET_RATIO!r}; expected (0, 1]")
+
+# A rejected batch is split in half (and a rejected single document is
+# shortened) this many times before the error is reported. The tokenizer
+# estimate is only a hint; the server has the final say.
+RERANK_MAX_SPLIT_DEPTH = int(os.getenv("RERANK_MAX_SPLIT_DEPTH", "6"))
+
+# Cross-encoders only need enough text to judge relevance, and a 512-token
+# chunk is ~1.4k chars of Russian: capping each document keeps 64 candidates
+# at a few batches instead of dozens (normal chunks are unaffected, oversized
+# parse artifacts are cut).
+RERANK_DOC_TOKEN_CAP = int(os.getenv("RERANK_DOC_TOKEN_CAP", "1024"))
+
+# Batch requests are independent, so a few run in parallel to keep the chat
+# latency acceptable. Set to 1 to make the adapter fully sequential.
+RERANK_MAX_WORKERS = max(1, int(os.getenv("RERANK_MAX_WORKERS", "4")))
+
+
+def build_rerank_batches(query: str, texts: List[str], max_token: int = MAX_RERANK_TOKEN, budget_ratio: float = RERANK_BATCH_BUDGET_RATIO) -> List[Tuple[List[int], List[str]]]:
+    """Pack ``texts`` into batches that fit one rerank context window.
+
+    Returns ``[(original_indices, batch_texts), ...]`` preserving the input
+    order. A document larger than the remaining budget is truncated to the
+    per-request document budget so a batch of one always fits, and documents
+    are never reordered: cross-encoder scores stay comparable across batches
+    because ``Base.similarity`` normalizes the merged array afterwards.
+    """
+    if not texts:
+        return []
+    total_budget = max(int(max_token * budget_ratio), 1)
+    doc_budget = max(total_budget - num_tokens_from_string(query), 1)
+
+    batches: List[Tuple[List[int], List[str]]] = []
+    indices: List[int] = []
+    batch: List[str] = []
+    used = 0
+    for index, text in enumerate(texts):
+        tokens = num_tokens_from_string(text)
+        if tokens > doc_budget:
+            text = truncate(text, doc_budget)
+            tokens = num_tokens_from_string(text)
+        if batch and used + tokens > doc_budget:
+            batches.append((indices, batch))
+            indices, batch, used = [], [], 0
+        indices.append(index)
+        batch.append(text)
+        used += tokens
+    if batch:
+        batches.append((indices, batch))
+    return batches
 
 
 def _describe_rerank_usage(res) -> str:
@@ -786,31 +847,71 @@ class GPUStackRerank(Base):
             "authorization": f"Bearer {key}",
         }
 
-    def _compute_rank(self, query: str, texts: List) -> Tuple[np.ndarray, int]:
+    def _post_batch(self, query: str, documents: List[str]):
         payload = {
             "model": self.model_name,
             "query": query,
-            "documents": texts,
-            "top_n": len(texts),
+            "documents": documents,
+            "top_n": len(documents),
         }
+        response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def _score_batch(self, query: str, indices: List[int], batch: List[str], rank: np.ndarray, depth: int = 0) -> int:
+        """Score one batch, splitting it when the backend rejects the size.
+
+        The local tokenizer estimate can undershoot the server tokenizer, so a
+        context-length 400 is handled here instead of being escalated: the
+        batch is halved, and a single document is shortened, until it fits.
+        """
+        try:
+            response_json = self._post_batch(query, batch)
+        except requests.exceptions.HTTPError as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            if status == 400 and depth < RERANK_MAX_SPLIT_DEPTH:
+                if len(batch) > 1:
+                    middle = len(batch) // 2
+                    return (
+                        self._score_batch(query, indices[:middle], batch[:middle], rank, depth + 1)
+                        + self._score_batch(query, indices[middle:], batch[middle:], rank, depth + 1)
+                    )
+                shortened = batch[0][: max(int(len(batch[0]) * 0.75), 1)]
+                if shortened and shortened != batch[0]:
+                    return self._score_batch(query, indices, [shortened], rank, depth + 1)
+            raise ValueError(f"Error calling GPUStackRerank model {self.model_name}: {str(error)}") from error
+        except requests.exceptions.RequestException as error:
+            raise ValueError(f"Error calling GPUStackRerank model {self.model_name}: {str(error)}") from error
 
         try:
-            response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=30)
-            response.raise_for_status()
-            response_json = response.json()
+            for result in response_json.get("results", []):
+                local_index = result.get("index")
+                if not isinstance(local_index, int) or not 0 <= local_index < len(indices):
+                    continue
+                rank[indices[local_index]] = result["relevance_score"]
+        except Exception as _e:
+            log_exception(_e, response_json)
+        return sum(num_tokens_from_string(text) for text in batch)
 
-            rank = np.zeros(len(texts), dtype=float)
-            token_count = sum(num_tokens_from_string(t) for t in texts)
-            try:
-                for result in response_json.get("results", []):
-                    rank[result["index"]] = result["relevance_score"]
-            except Exception as _e:
-                log_exception(_e, response)
+    def _compute_rank(self, query: str, texts: List) -> Tuple[np.ndarray, int]:
+        rank = np.zeros(len(texts), dtype=float)
+        prepared = [
+            truncate(text, RERANK_DOC_TOKEN_CAP)
+            if RERANK_DOC_TOKEN_CAP > 0 and num_tokens_from_string(text) > RERANK_DOC_TOKEN_CAP
+            else text
+            for text in texts
+        ]
+        batches = build_rerank_batches(query, prepared, self.max_token)
+        if not batches:
+            return (rank, 0)
 
-            return (rank, token_count)
-
-        except requests.exceptions.RequestException as e:
-            raise ValueError(f"Error calling GPUStackRerank model {self.model_name}: {str(e)}") from e
+        workers = min(RERANK_MAX_WORKERS, len(batches))
+        if workers == 1:
+            token_count = sum(self._score_batch(query, indices, batch, rank) for indices, batch in batches)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                token_count = sum(pool.map(lambda item: self._score_batch(query, item[0], item[1], rank), batches))
+        return (rank, token_count)
 
 
 class NovitaRerank(JinaRerank):
